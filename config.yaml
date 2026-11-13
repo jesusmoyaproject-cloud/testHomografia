@@ -1,0 +1,65 @@
+# Configuración del Módulo de Homografía 2D Estabilizada para Fútbol
+
+paths:
+  # Ruta al modelo YOLO11m-pose (.pt o .engine optimizado con TensorRT FP16)
+  pose_model_path: "G:/Mi unidad/ScoutingData/modelos/Yolo/homography/homography_v1/weights/best.pt"
+  # Ruta opcional al modelo detector/tracker de jugadores y balón (.pt o .engine). Dejar vacío "" si solo se usa pose.
+  detector_model_path: ""
+  # Ruta al video de entrada del partido de fútbol
+  video_path: "G:/Mi unidad/ScoutingData/videosPartidos/garVSsc_liga1max_2026_clausura_pt.mp4"
+  # Carpeta de salida para el video procesado y el archivo CSV
+  output_dir: "output"
+  # Nombres de archivos de salida
+  output_video_name: "homografia_2d_output.mp4"
+  output_csv_name: "detecciones_keypoints_homografia.csv"
+
+inference:
+  # Restricción máxima de lectura de frames del video
+  max_frames: 3000
+  # Dispositivo de inferencia: "cuda:0" (recomendado para FP16 / TensorRT) o "cpu"
+  device: "cuda:0"
+  # Activar precisión media FP16 (True recomendado en GPU / TensorRT)
+  half_precision: true
+  # Si es True y pose_model_path es .pt, intenta buscar/exportar motor TensorRT (.engine) en FP16
+  use_tensorrt_if_available: false
+  # Tamaño de imagen de entrada para YOLO (1280 para el modelo de homografía)
+  imgsz: 1280
+
+filtering_and_homography:
+  # Paso 2: Filtro de Confianza con Histéresis (Schmitt Trigger) y Exclusión de Bordes
+  conf_threshold: 0.30
+  conf_enter_threshold: 0.50
+  conf_exit_threshold: 0.25
+  min_confirm_frames: 2
+  border_margin_px: 12.0
+  max_jump_px: 100.0
+  # Cantidad máxima de frames que se conserva la coordenada compensada por cámara durante oclusión
+  hold_last_valid_frames: 8
+  # Paso 3: Tamaño fijo de la ventana del buffer histórico para el filtro de mediana (n frames)
+  median_window_size: 5
+  # Paso 4: Mínimo matemático de keypoints activos para calcular homografía 2D
+  min_keypoints: 4
+  # Paso 5: Umbral de error de reproyección para MAGSAC++ en cm sobre la cancha
+  magsac_reproj_thresh_cm: 120.0
+  magsac_max_iters: 10000
+  magsac_confidence: 0.999
+  # Paso 6: Factor alpha del Filtro EMA y regularización geométrica inversa (H_final^-1)
+  ema_alpha: 0.55
+  max_coast_frames: 15
+  regularize_keypoints_with_homography: true
+  keypoint_regularization_weight: 0.75
+
+pitch:
+  # Dimensiones estándar FIFA de la cancha en metros
+  largo_cancha: 105.0
+  ancho_cancha: 68.0
+  # Escala de renderizado del plano 2D (píxeles por metro) y margen exterior en píxeles
+  pixels_per_meter: 10.0
+  margin_px: 50
+
+tracking:
+  # Clases para proyectar jugadores y balón si detector_model_path está configurado
+  conf_threshold: 0.35
+  ball_class_id: 0
+  player_class_ids: [1, 2, 3]
+
