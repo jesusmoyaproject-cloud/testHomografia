@@ -5,17 +5,18 @@ paths:
   pose_model_path: "G:/Mi unidad/ScoutingData/modelos/OpenVino/yolov11m-homography_openvino_model"
   # Ruta opcional al modelo detector/tracker de jugadores y balón. Dejar vacío "" si solo se usa pose.
   detector_model_path: ""
-  # Ruta al video de entrada del partido de fútbol
+  # [PARÁMETRO DE ENTRADA] Ruta al video de entrada del partido de fútbol
   video_path: "G:/Mi unidad/ScoutingData/videosPartidos/garVSsc_liga1max_2026_clausura_pt.mp4"
   # Carpeta de salida para el video procesado y el archivo CSV
   output_dir: "output"
-  # Nombres de archivos de salida diferenciados para no sobrescribir la corrida de PyTorch (.pt)
+  # [PARÁMETRO DE ENTRADA] Nombre del video resultante
   output_video_name: "homografia_2d_openvino_output.mp4"
   output_csv_name: "detecciones_keypoints_homografia_openvino.csv"
 
 inference:
-  # Restricción máxima de lectura de frames del video
-  max_frames: 5000
+  # [PARÁMETRO DE ENTRADA] Cantidad de frames a procesar (ej. 3000, 5000).
+  # Si no se especifica (dejar null, ~ o comentar), procesará TODOS los frames del video.
+  max_frames: null
   # Dispositivo de inferencia para OpenVINO ("cpu" o "intel:cpu" / "intel:gpu")
   device: "cpu"
   # Precisión media FP16

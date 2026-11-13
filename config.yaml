@@ -5,17 +5,18 @@ paths:
   pose_model_path: "G:/Mi unidad/ScoutingData/modelos/Yolo/homography/homography_v1/weights/best.pt"
   # Ruta opcional al modelo detector/tracker de jugadores y balón (.pt o .engine). Dejar vacío "" si solo se usa pose.
   detector_model_path: ""
-  # Ruta al video de entrada del partido de fútbol
+  # [PARÁMETRO DE ENTRADA] Ruta al video de entrada del partido de fútbol
   video_path: "G:/Mi unidad/ScoutingData/videosPartidos/garVSsc_liga1max_2026_clausura_pt.mp4"
   # Carpeta de salida para el video procesado y el archivo CSV
   output_dir: "output"
-  # Nombres de archivos de salida
+  # [PARÁMETRO DE ENTRADA] Nombre del video resultante
   output_video_name: "homografia_2d_output.mp4"
   output_csv_name: "detecciones_keypoints_homografia.csv"
 
 inference:
-  # Restricción máxima de lectura de frames del video
-  max_frames: 3000
+  # [PARÁMETRO DE ENTRADA] Cantidad de frames a procesar (ej. 3000, 5000).
+  # Si no se especifica (dejar null, ~ o comentar), procesará TODOS los frames del video.
+  max_frames: null
   # Dispositivo de inferencia: "cuda:0" (recomendado para FP16 / TensorRT) o "cpu"
   device: "cuda:0"
   # Activar precisión media FP16 (True recomendado en GPU / TensorRT)

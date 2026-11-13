@@ -52,7 +52,7 @@ PITCH_EDGES: Tuple[Tuple[str, str], ...] = (
 class ThreadedVideoCapture:
     """Lectura asíncrona de video mediante cola acotada (sin pérdida de frames en archivos offline)."""
 
-    def __init__(self, video_path: str, max_frames: int = 5000, queue_size: int = 64):
+    def __init__(self, video_path: str, max_frames: Optional[int] = None, queue_size: int = 64):
         self.cap = cv2.VideoCapture(str(video_path))
         if not self.cap.isOpened():
             raise RuntimeError(f"No se pudo abrir el video de entrada: {video_path}")
@@ -60,7 +60,7 @@ class ThreadedVideoCapture:
         fps = float(self.cap.get(cv2.CAP_PROP_FPS))
         self.fps = 30.0 if (fps <= 0 or np.isnan(fps)) else fps
         self.total_video_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
-        self.max_frames = max(0, int(max_frames))
+        self.max_frames = int(max_frames) if (max_frames is not None and max_frames > 0) else None
 
         self._queue: queue.Queue = queue.Queue(maxsize=max(1, int(queue_size)))
         self._stop_event = threading.Event()
@@ -70,7 +70,9 @@ class ThreadedVideoCapture:
     def _reader_loop(self) -> None:
         read_count = 0
         try:
-            while not self._stop_event.is_set() and read_count < self.max_frames:
+            while not self._stop_event.is_set():
+                if self.max_frames is not None and read_count >= self.max_frames:
+                    break
                 ret, frame = self.cap.read()
                 if not ret:
                     break
@@ -447,7 +449,12 @@ def combine_side_by_side(left_frame: np.ndarray, right_canvas: np.ndarray) -> np
     return np.hstack([left_frame, resized_right])
 
 
-def run_pipeline(config_path: str = "config.yaml") -> None:
+def run_pipeline(
+    config_path: str = "config.yaml",
+    cli_video: Optional[str] = None,
+    cli_output_video: Optional[str] = None,
+    cli_max_frames: Optional[int] = None,
+) -> None:
     """Ejecuta el pipeline completo de homografía estabilizada."""
     cfg = load_config(config_path)
 
@@ -459,16 +466,32 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
 
     pose_model_path = paths_cfg.get("pose_model_path", "models/yolo11m-pose.pt")
     detector_model_path = paths_cfg.get("detector_model_path", "")
-    video_path = paths_cfg.get("video_path", "input/partido.mp4")
+
+    # 1. Video de entrada (CLI prevalece sobre YAML)
+    video_path = cli_video if cli_video else paths_cfg.get("video_path", "input/partido.mp4")
     output_dir = Path(paths_cfg.get("output_dir", "output"))
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    output_video_path = output_dir / paths_cfg.get("output_video_name", "homografia_2d_output.mp4")
-    output_csv_path = output_dir / paths_cfg.get("output_csv_name", "detecciones_keypoints_homografia.csv")
+    # 2. Nombre de video resultante (CLI prevalece sobre YAML)
+    output_video_name = cli_output_video if cli_output_video else paths_cfg.get("output_video_name", "homografia_2d_output.mp4")
+    output_video_path = output_dir / output_video_name
 
-    # Límite de frames configurable desde el YAML (por defecto 3000 si no se especifica)
-    configured_max_frames = int(inf_cfg.get("max_frames", 3000))
-    max_frames = configured_max_frames if configured_max_frames > 0 else 3000
+    # Archivo CSV de reporte asociado
+    output_csv_name = paths_cfg.get("output_csv_name")
+    if cli_output_video or not output_csv_name:
+        output_csv_name = f"detecciones_{Path(output_video_name).stem}.csv"
+    output_csv_path = output_dir / output_csv_name
+
+    # 3. Cantidad de frames a procesar (CLI prevalece sobre YAML; si no se especifica o es <=0, procesa todos)
+    raw_max_frames = cli_max_frames if cli_max_frames is not None else inf_cfg.get("max_frames", None)
+    max_frames: Optional[int] = None
+    if raw_max_frames is not None:
+        try:
+            val = int(raw_max_frames)
+            if val > 0:
+                max_frames = val
+        except (ValueError, TypeError):
+            max_frames = None
 
     is_openvino_pose = Path(pose_model_path).is_dir() or "openvino" in Path(pose_model_path).name.lower()
     if is_openvino_pose and "cuda" in str(inf_cfg.get("device", "")).lower():
@@ -505,13 +528,13 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
     kp_filter = KeypointTemporalFilter(
         num_keypoints=len(KP_MAP),
         conf_threshold=float(filt_cfg.get("conf_threshold", 0.30)),
-        conf_enter_threshold=float(filt_cfg.get("conf_enter_threshold", 0.42)),
-        conf_exit_threshold=float(filt_cfg.get("conf_exit_threshold", 0.22)),
+        conf_enter_threshold=float(filt_cfg.get("conf_enter_threshold", 0.50)),
+        conf_exit_threshold=float(filt_cfg.get("conf_exit_threshold", 0.25)),
         min_confirm_frames=int(filt_cfg.get("min_confirm_frames", 2)),
         window_size=int(filt_cfg.get("median_window_size", 5)),
         hold_last_valid_frames=int(filt_cfg.get("hold_last_valid_frames", 8)),
         border_margin_px=float(filt_cfg.get("border_margin_px", 12.0)),
-        max_jump_px=float(filt_cfg.get("max_jump_px", 65.0)),
+        max_jump_px=float(filt_cfg.get("max_jump_px", 100.0)),
     )
     homography_stabilizer = HomographyStabilizer(
         pitch_canvas=pitch_canvas,
@@ -519,13 +542,13 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
         magsac_reproj_thresh_cm=float(filt_cfg.get("magsac_reproj_thresh_cm", 120.0)),
         magsac_max_iters=int(filt_cfg.get("magsac_max_iters", 10000)),
         magsac_confidence=float(filt_cfg.get("magsac_confidence", 0.999)),
-        ema_alpha=float(filt_cfg.get("ema_alpha", 0.50)),
+        ema_alpha=float(filt_cfg.get("ema_alpha", 0.55)),
         max_coast_frames=int(filt_cfg.get("max_coast_frames", 15)),
         regularize_keypoints_with_homography=bool(
             filt_cfg.get("regularize_keypoints_with_homography", True)
         ),
         keypoint_regularization_weight=float(
-            filt_cfg.get("keypoint_regularization_weight", 0.65)
+            filt_cfg.get("keypoint_regularization_weight", 0.75)
         ),
     )
 
@@ -540,7 +563,13 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
     cap = ThreadedVideoCapture(str(video_path), max_frames=max_frames, queue_size=64)
     fps = cap.fps
     total_video_frames = cap.total_video_frames
-    frames_to_process = min(max_frames, total_video_frames) if total_video_frames > 0 else max_frames
+
+    if max_frames is not None and max_frames > 0:
+        frames_to_process = min(max_frames, total_video_frames) if total_video_frames > 0 else max_frames
+        info_frames_str = f"{frames_to_process} frames"
+    else:
+        frames_to_process = total_video_frames if total_video_frames > 0 else -1
+        info_frames_str = f"{total_video_frames} frames (todos)" if total_video_frames > 0 else "todos los frames"
 
     writer: Optional[ThreadedVideoWriter] = None
 
@@ -575,7 +604,7 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
         "distancia_detectado_vs_real_cm",
     ]
 
-    print(f"[INFO] Procesando hasta {frames_to_process} frames de '{video_path}' (Threaded I/O)...")
+    print(f"[INFO] Procesando {info_frames_str} de '{video_path}' (Threaded I/O)...")
 
     frame_idx = 0
     try:
@@ -583,7 +612,9 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
             csv_writer = csv.writer(csv_file)
             csv_writer.writerow(csv_columns)
 
-            while frame_idx < max_frames:
+            while True:
+                if max_frames is not None and frame_idx >= max_frames:
+                    break
                 ret, frame = cap.read()
                 if not ret or frame is None:
                     break
@@ -767,7 +798,10 @@ def run_pipeline(config_path: str = "config.yaml") -> None:
                 frame_idx += 1
 
                 if frame_idx % 100 == 0:
-                    print(f"[INFO] Frame {frame_idx}/{frames_to_process} procesado...")
+                    if isinstance(frames_to_process, int) and frames_to_process > 0:
+                        print(f"[INFO] Frame {frame_idx}/{frames_to_process} procesado...")
+                    else:
+                        print(f"[INFO] Frame {frame_idx} procesado...")
     finally:
         cap.release()
         if writer is not None:
@@ -784,12 +818,39 @@ def main() -> None:
     )
     parser.add_argument(
         "--config",
+        "-c",
         type=str,
         default="config.yaml",
         help="Ruta al archivo de configuración YAML (por defecto: config.yaml)",
     )
+    parser.add_argument(
+        "--video",
+        "-v",
+        type=str,
+        default=None,
+        help="Ruta al video de entrada (anula video_path del archivo .yaml)",
+    )
+    parser.add_argument(
+        "--output-video",
+        "-o",
+        type=str,
+        default=None,
+        help="Nombre del video resultante (anula output_video_name del archivo .yaml)",
+    )
+    parser.add_argument(
+        "--max-frames",
+        "-n",
+        type=int,
+        default=None,
+        help="Cantidad de frames a procesar. Si no se especifica o es <= 0, procesa todos los frames.",
+    )
     args = parser.parse_args()
-    run_pipeline(args.config)
+    run_pipeline(
+        config_path=args.config,
+        cli_video=args.video,
+        cli_output_video=args.output_video,
+        cli_max_frames=args.max_frames,
+    )
 
 
 if __name__ == "__main__":

@@ -9,19 +9,20 @@ paths:
   # Ruta opcional al modelo detector/tracker de jugadores y balón (.engine o .pt)
   detector_model_path: ""
   
-  # Ruta al video de entrada del partido de fútbol
+  # [PARÁMETRO DE ENTRADA] Ruta al video de entrada del partido de fútbol
   video_path: "G:/Mi unidad/ScoutingData/videosPartidos/garVSsc_liga1max_2026_clausura_pt.mp4"
   
   # Carpeta de salida para el video procesado y el archivo CSV
   output_dir: "output/engine"
   
-  # Nombres de archivos de salida para la inferencia con TensorRT Engine
+  # [PARÁMETRO DE ENTRADA] Nombre del video resultante para la inferencia con TensorRT Engine
   output_video_name: "homografia_2d_engine_output.mp4"
   output_csv_name: "detecciones_keypoints_homografia_engine.csv"
 
 inference:
-  # Límite de lectura de frames del video (configurable)
-  max_frames: 5000
+  # [PARÁMETRO DE ENTRADA] Cantidad de frames a procesar (ej. 3000, 5000).
+  # Si no se especifica (dejar null, ~ o comentar), procesará TODOS los frames del video.
+  max_frames: null
   # Dispositivo de inferencia para TensorRT (debe ser una GPU NVIDIA con CUDA)
   device: "cuda:0"
   # Precisión media FP16 habilitada para el motor TensorRT

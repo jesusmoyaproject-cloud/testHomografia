@@ -68,3 +68,4 @@ python inference.py --config config_openvino.yaml
 ```bash
 python inference.py --config config_engine.yaml
 ```
+
