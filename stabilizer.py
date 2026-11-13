@@ -437,8 +437,7 @@ class HomographyStabilizer:
 
     def _has_valid_geometry_spread(self, active_records: List[KeypointFrameRecord]) -> bool:
         """
-        Verifica que los puntos activos no sean colineales ni degenerados y que respeten
-        la orientación izquierda-derecha de la cámara principal.
+        Verifica que los puntos activos no sean colineales ni degenerados en cancha ni en imagen.
         """
         if len(active_records) < self.min_keypoints:
             return False
@@ -455,19 +454,11 @@ class HomographyStabilizer:
         if len(unique_x_m) < 2 or len(unique_y_m) < 2:
             return False
 
-        valid_pairs = 0
-        inverted_pairs = 0
-        n = len(active_records)
-        for i in range(n):
-            for j in range(i + 1, n):
-                dx_cm = pts_cm[j, 0] - pts_cm[i, 0]
-                if abs(dx_cm) >= 400.0:
-                    dx_px = pts_px[j, 0] - pts_px[i, 0]
-                    valid_pairs += 1
-                    if dx_cm * dx_px < 0:
-                        inverted_pairs += 1
-
-        if valid_pairs > 0 and (inverted_pairs / valid_pairs) > 0.30:
+        # Verificar que los puntos no sean colineales en imagen (área/dispersión 2D mínima)
+        centered_px = pts_px - np.mean(pts_px, axis=0)
+        cov_px = np.cov(centered_px.T)
+        eigvals = np.linalg.eigvalsh(cov_px)
+        if float(np.min(eigvals)) < 25.0:
             return False
 
         return True
@@ -499,6 +490,20 @@ class HomographyStabilizer:
         if float(np.max(errs)) > self.magsac_reproj_thresh_cm * 1.35:
             return False
 
+        # Verificar que el jacobiano local en el centroide de los inliers conserve orientación positiva
+        cx, cy = float(np.mean(inlier_src[:, 0])), float(np.mean(inlier_src[:, 1]))
+        w_c = h_norm[2, 0] * cx + h_norm[2, 1] * cy + h_norm[2, 2]
+        if abs(w_c) < 1e-6:
+            return False
+        px_c = (h_norm[0, 0] * cx + h_norm[0, 1] * cy + h_norm[0, 2]) / w_c
+        py_c = (h_norm[1, 0] * cx + h_norm[1, 1] * cy + h_norm[1, 2]) / w_c
+        j11 = (h_norm[0, 0] - h_norm[2, 0] * px_c) / w_c
+        j12 = (h_norm[0, 1] - h_norm[2, 1] * px_c) / w_c
+        j21 = (h_norm[1, 0] - h_norm[2, 0] * py_c) / w_c
+        j22 = (h_norm[1, 1] - h_norm[2, 1] * py_c) / w_c
+        if (j11 * j22 - j12 * j21) <= 0.0:
+            return False
+
         return True
 
     def _enforce_consistency_with_h_final(
@@ -516,10 +521,11 @@ class HomographyStabilizer:
         sin contaminar el estado interno de kp_filter (last_valid_xy / smoothed_xy).
         """
         if self.h_final_cm is None:
-            if kp_filter is not None:
-                for r in records:
-                    if r.is_active:
-                        kp_filter.deactivate_point(r.kp_index, r)
+            return
+
+        # Nunca desactivar keypoints cuando H_final no se actualizó (p. ej. coasting/paneo),
+        # ya que una matriz rezagada provocaría falsos descartes en cadena.
+        if not h_was_updated:
             return
 
         try:
@@ -532,6 +538,9 @@ class HomographyStabilizer:
             for r, m in zip(active_records, strict_mask):
                 magsac_map[r.kp_index] = bool(m)
 
+        # Umbral amplio para tolerar retardo transitorio de EMA durante zoom/paneo rápido
+        outlier_deactivate_thresh_cm = self.magsac_reproj_thresh_cm * 2.5
+
         for rec in records:
             if not rec.is_active or rec.median_x is None or rec.median_y is None:
                 continue
@@ -543,13 +552,14 @@ class HomographyStabilizer:
             err_cm = float(np.hypot(proj_cm[0] - real_cm[0], proj_cm[1] - real_cm[1]))
 
             is_inlier = magsac_map.get(idx, err_cm <= self.magsac_reproj_thresh_cm)
-            if err_cm <= self.magsac_reproj_thresh_cm and is_inlier:
+            if is_inlier and err_cm <= outlier_deactivate_thresh_cm:
                 rec.is_inlier_magsac = True
                 if kp_filter is not None:
                     kp_filter.inlier_streak[idx] += 1
             else:
                 rec.is_inlier_magsac = False
-                if kp_filter is not None:
+                # Solo desactivar si MAGSAC++ lo rechazó Y además diverge fuertemente (> 2.5x umbral)
+                if kp_filter is not None and err_cm > outlier_deactivate_thresh_cm:
                     if kp_filter.inlier_streak[idx] < 2 or h_inv is None:
                         kp_filter.deactivate_point(idx, rec)
                         continue
@@ -557,23 +567,19 @@ class HomographyStabilizer:
                         kp_filter.buffers_x[idx].pop()
                         kp_filter.buffers_y[idx].pop()
 
-                    if h_was_updated:
-                        real_cm_arr = np.array([[[real_cm[0], real_cm[1]]]], dtype=np.float64)
-                        ideal_px = cv2.perspectiveTransform(real_cm_arr, h_inv).reshape(2)
-                        if (
-                            np.all(np.isfinite(ideal_px))
-                            and kp_filter._is_within_safe_frame(
-                                float(ideal_px[0]), float(ideal_px[1]), frame_w, frame_h
-                            )
-                            and float(np.hypot(ideal_px[0] - rec.median_x, ideal_px[1] - rec.median_y)) <= 45.0
-                        ):
-                            rec.status = "ACTIVE_HELD"
-                            rec.is_inlier_magsac = True
-                            rec.median_x = float(ideal_px[0])
-                            rec.median_y = float(ideal_px[1])
-                        else:
-                            kp_filter.deactivate_point(idx, rec)
-                            continue
+                    real_cm_arr = np.array([[[real_cm[0], real_cm[1]]]], dtype=np.float64)
+                    ideal_px = cv2.perspectiveTransform(real_cm_arr, h_inv).reshape(2)
+                    if (
+                        np.all(np.isfinite(ideal_px))
+                        and kp_filter._is_within_safe_frame(
+                            float(ideal_px[0]), float(ideal_px[1]), frame_w, frame_h
+                        )
+                        and float(np.hypot(ideal_px[0] - rec.median_x, ideal_px[1] - rec.median_y)) <= 45.0
+                    ):
+                        rec.status = "ACTIVE_HELD"
+                        rec.is_inlier_magsac = True
+                        rec.median_x = float(ideal_px[0])
+                        rec.median_y = float(ideal_px[1])
                     else:
                         kp_filter.deactivate_point(idx, rec)
                         continue
@@ -714,25 +720,36 @@ class HomographyStabilizer:
 
         h_t_norm = self._normalize_homography(h_t.astype(np.float64))
 
-        # Paso 6: Suavizado EMA adaptativo de H_t
+        # Paso 6: Suavizado EMA adaptativo de H_t (considerando paneo + cambio de escala/zoom)
         cam_speed = 0.0
         if kp_filter is not None:
             cam_speed = float(np.hypot(kp_filter.last_camera_delta[0], kp_filter.last_camera_delta[1]))
         t_cam = float(np.clip(cam_speed / 6.0, 0.0, 1.0))
-        adaptive_alpha = self.ema_alpha_slow + t_cam * (self.ema_alpha_fast - self.ema_alpha_slow)
 
         self.coast_frames = 0
         if self.h_final_cm is None:
             self.h_final_cm = h_t_norm
             self.last_status = f"INITIALIZED_MAGSAC (inliers={self.last_inliers_count}/{len(active_records)})"
         else:
+            # Detectar si hay zoom/cambio de perspectiva midiendo la diferencia entre H_final previa y H_t actual
+            prev_proj = cv2.perspectiveTransform(inlier_src.reshape(-1, 1, 2), self.h_final_cm).reshape(-1, 2)
+            curr_proj = cv2.perspectiveTransform(inlier_src.reshape(-1, 1, 2), h_t_norm).reshape(-1, 2)
+            h_shift_cm = float(np.percentile(np.linalg.norm(curr_proj - prev_proj, axis=1), 75))
+            t_zoom = float(np.clip(h_shift_cm / 45.0, 0.0, 1.0))
+            adaptive_alpha = self.ema_alpha_slow + max(t_cam, t_zoom) * (self.ema_alpha_fast - self.ema_alpha_slow)
+
             blended = self._normalize_homography(
                 adaptive_alpha * h_t_norm + (1.0 - adaptive_alpha) * self.h_final_cm
             )
-            if self._is_homography_well_conditioned(blended, inlier_src, inlier_dst):
+            curr_max_err = float(np.max(np.linalg.norm(curr_proj - inlier_dst, axis=1)))
+            blend_proj = cv2.perspectiveTransform(inlier_src.reshape(-1, 1, 2), blended).reshape(-1, 2)
+            blend_max_err = float(np.max(np.linalg.norm(blend_proj - inlier_dst, axis=1)))
+            blend_not_distorted = blend_max_err <= max(self.magsac_reproj_thresh_cm, curr_max_err * 1.5)
+
+            if blend_not_distorted and self._is_homography_well_conditioned(blended, inlier_src, inlier_dst):
                 self.h_final_cm = blended
                 self.last_status = f"UPDATED_MAGSAC_EMA (inliers={self.last_inliers_count}/{len(active_records)})"
-            elif self.last_inliers_count >= 6:
+            elif self.last_inliers_count >= 5:
                 self.h_final_cm = h_t_norm
                 self.last_status = f"RESET_TO_MAGSAC (inliers={self.last_inliers_count}/{len(active_records)})"
             else:

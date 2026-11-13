@@ -12,6 +12,7 @@ Ejecuta los 7 pasos de la arquitectura:
 
 import argparse
 import csv
+import logging
 from pathlib import Path
 import queue
 import threading
@@ -22,6 +23,22 @@ import yaml
 
 from pitch_config import CENTER_KEYPOINTS, KP_MAP, Pitch2DCanvas
 from stabilizer import HomographyStabilizer, KeypointFrameRecord, KeypointTemporalFilter
+
+
+class _SuppressHalfDeprecatedFilter(logging.Filter):
+    """Oculta la advertencia de Ultralytics sobre la deprecación de 'half' en inferencia."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        msg = record.getMessage()
+        return not ("'half' is deprecated" in msg or "Use 'quantize' instead" in msg)
+
+
+def _install_ultralytics_log_filter() -> None:
+    """Registra el filtro en el logger de Ultralytics sin duplicarlo."""
+    for logger_name in ("ultralytics", "ultralytics.utils"):
+        logger = logging.getLogger(logger_name)
+        if not any(isinstance(f, _SuppressHalfDeprecatedFilter) for f in logger.filters):
+            logger.addFilter(_SuppressHalfDeprecatedFilter())
 
 
 PITCH_EDGES: Tuple[Tuple[str, str], ...] = (
@@ -353,26 +370,122 @@ def draw_frame_annotations(
     return vis
 
 
+def _compute_camera_fov_polygon_px(
+    h_final_cm: Optional[np.ndarray],
+    frame_w: int,
+    frame_h: int,
+    pitch_canvas: Pitch2DCanvas,
+) -> Optional[np.ndarray]:
+    """
+    Proyecta el rectángulo visible del frame de cámara hacia el plano 2D con recorte homogéneo
+    (w >= eps) para evitar inversiones cuando el borde superior de la imagen supera el horizonte.
+    """
+    if h_final_cm is None:
+        return None
+
+    corners = np.array(
+        [
+            [0.0, 0.0],
+            [float(frame_w - 1), 0.0],
+            [float(frame_w - 1), float(frame_h - 1)],
+            [0.0, float(frame_h - 1)],
+        ],
+        dtype=np.float64,
+    )
+    homog_in = np.column_stack([corners, np.ones(4, dtype=np.float64)])
+    homog_out = (h_final_cm @ homog_in.T).T  # (4, 3): [X, Y, w]
+
+    # Recorte Sutherland-Hodgman contra el plano w >= w_min para puntos válidos delante de cámara
+    w_min = 0.02
+    clipped_pts: List[np.ndarray] = []
+    n = len(homog_out)
+    for i in range(n):
+        p1 = homog_out[i]
+        p2 = homog_out[(i + 1) % n]
+        in1 = p1[2] >= w_min
+        in2 = p2[2] >= w_min
+        if in1:
+            clipped_pts.append(p1)
+        if in1 != in2:
+            denom = p2[2] - p1[2]
+            if abs(denom) > 1e-9:
+                t = (w_min - p1[2]) / denom
+                clipped_pts.append(p1 + t * (p2 - p1))
+
+    if len(clipped_pts) < 3:
+        return None
+
+    poly_px: List[List[int]] = []
+    for p in clipped_pts:
+        cm_x = float(p[0] / p[2])
+        cm_y = float(p[1] / p[2])
+        px_x, px_y = pitch_canvas.cm_to_px(cm_x, cm_y)
+        if not (np.isfinite(px_x) and np.isfinite(px_y)):
+            return None
+        poly_px.append(
+            [
+                int(np.clip(round(px_x), -2000, pitch_canvas.width_px + 2000)),
+                int(np.clip(round(px_y), -2000, pitch_canvas.height_px + 2000)),
+            ]
+        )
+
+    return np.array(poly_px, dtype=np.int32).reshape(-1, 1, 2)
+
+
 def draw_2d_minimap_annotations(
     pitch_canvas: Pitch2DCanvas,
     records: List[KeypointFrameRecord],
     projected_kps_px: Dict[int, Tuple[float, float]],
     projected_objects_px: List[Tuple[Tuple[float, float], float, int]],
     ball_class_id: int,
+    projected_kps_cm: Optional[Dict[int, Tuple[float, float]]] = None,
+    fov_polygon_px: Optional[np.ndarray] = None,
 ) -> np.ndarray:
     """
-    Dibuja en el plano 2D (lado derecho) los puntos detectados proyectados con su confianza (conf),
-    conectándolos con su ubicación real en la plantilla 2D, además de jugadores/balón proyectados.
+    Dibuja en el plano 2D (lado izquierdo) la zona detectada por la cámara, el punto real
+    de cada keypoint, el punto detectado proyectado, su confianza y la distancia en cm.
     """
     canvas = pitch_canvas.get_clean_canvas()
 
-    # Dibujar keypoints detectados proyectados en el plano 2D con su conf
+    # Pintar la zona de cancha que detecta la cámara (FOV) restringida al rectángulo de la cancha
+    if fov_polygon_px is not None and len(fov_polygon_px) >= 3:
+        m = pitch_canvas.margin_px
+        pitch_x1, pitch_y1 = m, m
+        pitch_x2 = pitch_canvas.width_px - m
+        pitch_y2 = pitch_canvas.height_px - m
+
+        fov_mask = np.zeros((canvas.shape[0], canvas.shape[1]), dtype=np.uint8)
+        cv2.fillPoly(fov_mask, [fov_polygon_px], 255)
+        pitch_mask = np.zeros_like(fov_mask)
+        pitch_mask[pitch_y1:pitch_y2, pitch_x1:pitch_x2] = 255
+        clipped_mask = cv2.bitwise_and(fov_mask, pitch_mask)
+
+        if np.any(clipped_mask):
+            overlay = canvas.copy()
+            overlay[clipped_mask > 0] = (170, 245, 170)
+            cv2.addWeighted(overlay, 0.24, canvas, 0.76, 0.0, dst=canvas)
+
+            contours, _ = cv2.findContours(clipped_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            cv2.drawContours(canvas, contours, -1, (225, 255, 225), 1, lineType=cv2.LINE_AA)
+
+    errors_cm: List[float] = []
+
+    # Dibujar punto real, punto detectado, línea de error y distancia en cm
     for rec in records:
         if rec.kp_index not in projected_kps_px:
             continue
 
         det_px_x, det_px_y = projected_kps_px[rec.kp_index]
         real_px_x, real_px_y = pitch_canvas.coords_px[rec.kp_id]
+        real_cm_x, real_cm_y = pitch_canvas.coords_cm[rec.kp_id]
+
+        if projected_kps_cm is not None and rec.kp_index in projected_kps_cm:
+            det_cm_x, det_cm_y = projected_kps_cm[rec.kp_index]
+        else:
+            det_cm_x = (det_px_x - pitch_canvas.margin_px) * (100.0 / pitch_canvas.ppm)
+            det_cm_y = (det_px_y - pitch_canvas.margin_px) * (100.0 / pitch_canvas.ppm)
+        dist_cm = float(np.hypot(det_cm_x - real_cm_x, det_cm_y - real_cm_y))
+        errors_cm.append(dist_cm)
 
         pt_det = (
             int(np.clip(round(det_px_x), 0, canvas.shape[1] - 1)),
@@ -383,19 +496,23 @@ def draw_2d_minimap_annotations(
         # Línea entre el keypoint real de la cancha y el keypoint detectado proyectado
         cv2.line(canvas, pt_real, pt_det, (180, 220, 255), 1, lineType=cv2.LINE_AA)
 
+        # Punto real del keypoint en la plantilla 2D (blanco con borde verde oscuro)
+        cv2.circle(canvas, pt_real, 4, (255, 255, 255), -1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, pt_real, 5, (0, 140, 0), 1, lineType=cv2.LINE_AA)
+
         # Círculo del punto detectado en el plano 2D
         color = (0, 255, 255) if rec.is_inlier_magsac else (0, 140, 255)
-        cv2.circle(canvas, pt_det, 6, color, -1, lineType=cv2.LINE_AA)
-        cv2.circle(canvas, pt_det, 7, (0, 0, 0), 1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, pt_det, 5, color, -1, lineType=cv2.LINE_AA)
+        cv2.circle(canvas, pt_det, 6, (0, 0, 0), 1, lineType=cv2.LINE_AA)
 
-        # Mostrar ID del keypoint y su nivel de confianza (conf) en el plano 2D
-        text_2d = f"{rec.kp_id}:{rec.conf:.2f}"
+        # Mostrar ID, confianza y distancia en cm respecto al punto real
+        text_2d = f"{rec.kp_id}({rec.conf:.2f}) {dist_cm:.1f}cm"
         cv2.putText(
             canvas,
             text_2d,
             (pt_det[0] + 6, pt_det[1] + 4),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
+            0.35,
             (0, 0, 0),
             2,
             cv2.LINE_AA,
@@ -405,7 +522,7 @@ def draw_2d_minimap_annotations(
             text_2d,
             (pt_det[0] + 6, pt_det[1] + 4),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.38,
+            0.35,
             color,
             1,
             cv2.LINE_AA,
@@ -424,13 +541,14 @@ def draw_2d_minimap_annotations(
             cv2.circle(canvas, pt, 7, (255, 120, 0), -1, lineType=cv2.LINE_AA)
             cv2.circle(canvas, pt, 8, (255, 255, 255), 1, lineType=cv2.LINE_AA)
 
-    # Título en el lienzo 2D
+    # Título y leyenda en el lienzo 2D
+    mean_err_str = f" | Err medio: {np.mean(errors_cm):.1f}cm" if errors_cm else ""
     cv2.putText(
         canvas,
-        "PLANO 2D ESTABILIZADO (MAGSAC++ & EMA) - KEYPOINTS + CONF",
+        f"PLANO 2D (MAGSAC++ & EMA){mean_err_str} | Blanco:Real Cian:Det",
         (pitch_canvas.margin_px, 28),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.55,
+        0.52,
         (255, 255, 255),
         2,
         cv2.LINE_AA,
@@ -439,14 +557,14 @@ def draw_2d_minimap_annotations(
     return canvas
 
 
-def combine_side_by_side(left_frame: np.ndarray, right_canvas: np.ndarray) -> np.ndarray:
-    """Combina el video del partido (izquierda) y el plano 2D (derecha) ajustando a la misma altura."""
-    target_h = left_frame.shape[0]
-    h_r, w_r = right_canvas.shape[:2]
-    scale = target_h / float(h_r)
-    new_w_r = int(round(w_r * scale))
-    resized_right = cv2.resize(right_canvas, (new_w_r, target_h), interpolation=cv2.INTER_LINEAR)
-    return np.hstack([left_frame, resized_right])
+def combine_side_by_side(left_canvas_2d: np.ndarray, right_camera_frame: np.ndarray) -> np.ndarray:
+    """Combina el plano 2D (izquierda) y el video del partido (derecha) en una sola fila."""
+    target_h = right_camera_frame.shape[0]
+    h_l, w_l = left_canvas_2d.shape[:2]
+    scale = target_h / float(h_l)
+    new_w_l = int(round(w_l * scale))
+    resized_left = cv2.resize(left_canvas_2d, (new_w_l, target_h), interpolation=cv2.INTER_LINEAR)
+    return np.hstack([resized_left, right_camera_frame])
 
 
 def run_pipeline(
@@ -456,6 +574,7 @@ def run_pipeline(
     cli_max_frames: Optional[int] = None,
 ) -> None:
     """Ejecuta el pipeline completo de homografía estabilizada."""
+    _install_ultralytics_log_filter()
     cfg = load_config(config_path)
 
     paths_cfg = cfg.get("paths", {})
@@ -620,13 +739,15 @@ def run_pipeline(
                     break
 
                 # 1. Inferencia del Frame (YOLO Pose)
-                pose_results = pose_model.predict(
-                    source=frame,
-                    device=device,
-                    half=half,
-                    imgsz=imgsz,
-                    verbose=False,
-                )
+                pose_predict_kwargs: Dict[str, Any] = {
+                    "source": frame,
+                    "device": device,
+                    "imgsz": imgsz,
+                    "verbose": False,
+                }
+                if half and not is_openvino_pose and Path(pose_model_path).suffix.lower() != ".engine":
+                    pose_predict_kwargs["half"] = True
+                pose_results = pose_model.predict(**pose_predict_kwargs)
                 raw_xy, raw_conf = extract_best_pitch_keypoints(pose_results)
 
                 # 2 y 3. Filtro de Confianza Pre-Buffer + Buffer Histórico y Filtro de Mediana
@@ -670,14 +791,16 @@ def run_pipeline(
                 ball_class_id = int(track_cfg.get("ball_class_id", 0))
 
                 if detector_model is not None:
-                    det_results = detector_model.predict(
-                        source=frame,
-                        device=device,
-                        half=half,
-                        imgsz=imgsz,
-                        conf=float(track_cfg.get("conf_threshold", 0.35)),
-                        verbose=False,
-                    )
+                    det_predict_kwargs: Dict[str, Any] = {
+                        "source": frame,
+                        "device": device,
+                        "imgsz": imgsz,
+                        "conf": float(track_cfg.get("conf_threshold", 0.35)),
+                        "verbose": False,
+                    }
+                    if half and Path(detector_model_path).suffix.lower() == ".pt":
+                        det_predict_kwargs["half"] = True
+                    det_results = detector_model.predict(**det_predict_kwargs)
                     if det_results and len(det_results) > 0 and det_results[0].boxes is not None:
                         boxes = det_results[0].boxes
                         xyxy = boxes.xyxy.cpu().numpy()
@@ -768,8 +891,25 @@ def run_pipeline(
                             for i, kp_id in enumerate(pitch_kp_ids)
                         }
 
-                # Renderizar vista izquierda (partido) y vista derecha (plano 2D)
-                left_view = draw_frame_annotations(
+                # Calcular zona de cancha visible por la cámara (FOV) en el plano 2D
+                fov_polygon_px = _compute_camera_fov_polygon_px(
+                    homography_stabilizer.h_final_cm,
+                    frame.shape[1],
+                    frame.shape[0],
+                    pitch_canvas,
+                )
+
+                # Renderizar vista izquierda (plano 2D) y vista derecha (partido) en una sola fila
+                minimap_view = draw_2d_minimap_annotations(
+                    pitch_canvas=pitch_canvas,
+                    records=kp_records,
+                    projected_kps_px=projected_kps_px,
+                    projected_objects_px=projected_objects_px,
+                    ball_class_id=ball_class_id,
+                    projected_kps_cm=projected_kps_cm,
+                    fov_polygon_px=fov_polygon_px,
+                )
+                camera_view = draw_frame_annotations(
                     frame=frame,
                     records=kp_records,
                     frame_idx=frame_idx,
@@ -778,14 +918,7 @@ def run_pipeline(
                     ball_class_id=ball_class_id,
                     projected_pitch_pts=projected_pitch_pts,
                 )
-                right_view = draw_2d_minimap_annotations(
-                    pitch_canvas=pitch_canvas,
-                    records=kp_records,
-                    projected_kps_px=projected_kps_px,
-                    projected_objects_px=projected_objects_px,
-                    ball_class_id=ball_class_id,
-                )
-                combined_frame = combine_side_by_side(left_view, right_view)
+                combined_frame = combine_side_by_side(minimap_view, camera_view)
 
                 if writer is None:
                     out_h, out_w = combined_frame.shape[:2]
